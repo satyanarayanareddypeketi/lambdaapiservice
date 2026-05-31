@@ -1,0 +1,283 @@
+name: DevX Platform Pipeline
+
+on:
+  push:
+    branches: [main, develop, release/**]
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+
+  # ── STAGE 1: BUILD ──────────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      python-version: ${{ steps.setup.outputs.python-version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        id: setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Lint (ruff)
+        run: |
+          pip install ruff
+          ruff check . --output-format=github
+
+      - name: Validate Lambda handler exists
+        run: |
+          python -c "import myfirstlambdaapi; print('Lambda handler OK')"
+
+      - name: Cache build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            .venv
+          key: build-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+  # ── STAGE 2: TEST ───────────────────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dev dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov moto boto3
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ \
+            --cov=. \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --cov-fail-under=70 \
+            -v
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+  # ── STAGE 3: SECURITY SCAN ──────────────────────────────────────────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Scan for secrets (detect-secrets)
+        run: |
+          pip install detect-secrets
+          detect-secrets scan --baseline .secrets.baseline || \
+          detect-secrets scan > .secrets.baseline
+          detect-secrets audit .secrets.baseline --report
+
+      - name: Dependency vulnerability scan (pip-audit)
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --format=json --output=pip-audit.json || true
+          pip-audit -r requirements.txt
+
+      - name: Static security analysis (bandit)
+        run: |
+          pip install bandit
+          bandit -r . \
+            --exclude ./tests \
+            -f json \
+            -o bandit-report.json || true
+          bandit -r . --exclude ./tests -ll
+
+      - name: Terraform security scan (checkov)
+        if: hashFiles('terraform/**') != ''
+        run: |
+          pip install checkov
+          checkov -d terraform/ \
+            --framework terraform \
+            --output cli \
+            --compact \
+            --soft-fail
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            pip-audit.json
+            bandit-report.json
+          retention-days: 14
+
+  # ── STAGE 4: PACKAGE ────────────────────────────────────────────────────────
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [test, security-scan]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install production dependencies
+        run: |
+          pip install --upgrade pip
+          mkdir -p package
+          pip install -r requirements.txt -t package/
+
+      - name: Package Lambda
+        run: |
+          cp myfirstlambdaapi.py package/
+          cd package && zip -r ../lambda.zip . -x "*.pyc" -x "*/__pycache__/*"
+          cd ..
+          echo "Package size: $(du -sh lambda.zip | cut -f1)"
+
+      - name: Upload Lambda package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-package
+          path: lambda.zip
+          retention-days: 30
+
+      - name: Generate build metadata
+        run: |
+          echo '{
+            "version": "${{ github.sha }}",
+            "branch": "${{ github.ref_name }}",
+            "build_number": "${{ github.run_number }}",
+            "built_at": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
+          }' > build-metadata.json
+          cat build-metadata.json
+
+      - name: Upload build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata
+          path: build-metadata.json
+          retention-days: 30
+
+  # ── STAGE 5: DEPLOY ─────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: package
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Download Lambda package
+        uses: actions/download-artifact@v4
+        with:
+          name: lambda-package
+
+      - name: Deploy Lambda via Terraform
+        working-directory: terraform/
+        env:
+          TF_VAR_environment: prod
+          TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=task-api/prod/terraform.tfstate" \
+            -backend-config="region=${{ secrets.AWS_REGION }}"
+
+          terraform plan -out=tfplan
+          terraform apply -auto-approve tfplan
+
+      - name: Update Lambda code
+        run: |
+          aws lambda update-function-code \
+            --function-name task-api-prod \
+            --zip-file fileb://lambda.zip \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Wait for Lambda update
+        run: |
+          aws lambda wait function-updated \
+            --function-name task-api-prod \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Smoke test deployed Lambda
+        run: |
+          RESULT=$(aws lambda invoke \
+            --function-name task-api-prod \
+            --payload '{"httpMethod":"GET","path":"/health","pathParameters":null}' \
+            --region ${{ secrets.AWS_REGION }} \
+            response.json && cat response.json)
+          echo "Smoke test response: $RESULT"
+          STATUS=$(cat response.json | python3 -c "import sys,json; print(json.load(sys.stdin)['statusCode'])")
+          if [ "$STATUS" != "200" ]; then
+            echo "Smoke test FAILED with status $STATUS"
+            exit 1
+          fi
+          echo "Smoke test PASSED"
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "Deployment successful — version ${{ github.sha }}"
